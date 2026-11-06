@@ -100,3 +100,28 @@ Each site can have its own bot, so one site's block or long wait never slows the
 - If the environment variable `PORT` is set (Render does this), a plain status page answers on it
   so a free pinger can keep the service awake. It shows only queue counts, no secrets.
 - Tested against a fake Telegram server only (four bots, mixed posts, blocked YouTube).
+
+## Following profiles (new)
+
+Post `follow <profile link>` in the channel (or privately to a bot) and whatever that profile
+posts next is downloaded and posted to the channel by itself.
+
+- `follow https://www.instagram.com/someone/`   start following
+- `unfollow https://www.instagram.com/someone/` stop
+- `following`                                   each bot lists the profiles it follows (to your private chat)
+- The bot that owns that site (Instagram, Twitter/X, Pinterest, YouTube) takes the command.
+  Your command post is deleted once it worked; if the profile can't be read (private, login needed)
+  it gets a thumbs-down and stays.
+- Posts that already exist when you start following are **not** posted, only new ones.
+- Each profile is checked about every 120 minutes (change with `FOLLOW_EVERY_MIN`), with random
+  jitter and a minute or more between any two checks. Followed posts go through the same slow queue
+  as ordinary links and are posted with their caption; nothing is deleted or reacted to.
+- YouTube: a channel's `/videos` list (Shorts are not watched). Twitter/X: their own tweets, not
+  retweets. Instagram: posts and reels from the profile page.
+- Instagram profiles and Twitter/X timelines often need a login (cookies), and checking a profile
+  again and again is what Instagram blocks soonest. If a check fails you get one message, then it
+  backs off (up to 6 hours between tries).
+- The follow list is saved in `follows_<site>.json`. On a free host that loses files on restart
+  (Render free), set `FOLLOWS=<link>,<link>` in the environment: every restart re-adds those profiles
+  (silently, without posting what already exists).
+- Tested against a fake Telegram and sample downloader output only, not against the real sites.

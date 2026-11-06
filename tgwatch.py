@@ -27,16 +27,24 @@ or as environment variables TOKEN_INSTAGRAM, TOKEN_TWITTER, TOKEN_PINTEREST, TOK
 Every bot reads the channel but only takes links from its own site. ONLY=youtube (or
 ONLY=instagram,twitter,pinterest) picks which of them this computer/server runs.
 If PORT is set (e.g. on Render) a tiny status page is served so a pinger can keep it awake.
+
+FOLLOWING PROFILES: post   follow <profile link>   in the channel (or privately to the bot).
+The bot that owns that site remembers the profile, checks it every FOLLOW_EVERY_MIN minutes
+(default 120, with random jitter) and posts anything new to the channel. Posts that already exist
+when you start following are NOT posted. Also:  unfollow <profile link>   and   following
+FOLLOWS=<link>,<link> (environment) re-adds profiles after a restart on hosts that lose files.
 """
 import json
 import os
 import random
 import re
 import sys
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -60,6 +68,12 @@ REACT_DONE = "\U0001F44D"          # thumbs up (private chat only; channel posts
 
 BOT_DEFS = {"instagram": ["instagram"], "twitter": ["twitter"],
             "pinterest": ["pinterest"], "youtube": ["youtube"]}   # one bot per site
+
+FOLLOW_RE = re.compile(r"^\s*(follow|unfollow|following)\b", re.I)
+FOLLOW_EVERY = float(os.environ.get("FOLLOW_EVERY_MIN", "120")) * 60   # seconds between checks of one profile
+FOLLOW_GAP = (60, 180)             # seconds between two profile checks (any profile)
+FOLLOW_LIST = 10                   # newest posts looked at per check
+FOLLOW_SEEN_MAX = 300
 
 STOP = threading.Event()
 OUT_ROOT = Path("Downloads")
@@ -379,7 +393,7 @@ def parse_message(text):
 
 
 # ---------------------------------------------------------------- listener
-def ingest(cfg, qs, u):
+def ingest(cfg, qs, u, fs=None):
     """Turn one Telegram update into a queued job and acknowledge it straight away."""
     msg = u.get("message") or u.get("channel_post")
     if not msg:
@@ -401,6 +415,10 @@ def ingest(cfg, qs, u):
         say(cfg, reply, "Post a link in the channel (optionally 720 / 1080 / audio first), "
                         "or send it here. I download it on the laptop and post it to the channel.")
         return
+    if FOLLOW_RE.match(text):
+        if fs is not None:
+            handle_follow_command(cfg, fs, msg, text, reply, watched)
+        return   # never treat a follow command as a download
     urls, quality = parse_message(text)
     if not urls:
         if not watched:
@@ -429,7 +447,7 @@ def ingest(cfg, qs, u):
                     f"Roughly {mins} min for everything waiting (rough guess).")
 
 
-def listener_step(cfg, qs, state, timeout=25):
+def listener_step(cfg, qs, state, timeout=25, fs=None):
     try:
         updates = api(cfg, "getUpdates", {"offset": state["offset"], "timeout": timeout}, timeout=timeout + 15)
     except TgError as e:
@@ -438,15 +456,232 @@ def listener_step(cfg, qs, state, timeout=25):
         return
     for u in updates:
         try:
-            ingest(cfg, qs, u)
+            ingest(cfg, qs, u, fs)
         except Exception as e:   # one bad update must not stop the listener
             print("  (could not handle an update:", str(e).replace(cfg["BOT_TOKEN"], "***"), ")")
         state["offset"] = u["update_id"] + 1   # confirmed on the NEXT call, after the queue is saved
 
 
-def listener_loop(cfg, qs, state):
+def listener_loop(cfg, qs, state, fs=None):
     while not STOP.is_set():
-        listener_step(cfg, qs, state)
+        listener_step(cfg, qs, state, fs=fs)
+
+
+# ---------------------------------------------------------------- following profiles
+def norm_profile(url):
+    u = urlparse(url.strip().rstrip(".,)"))
+    return f"{u.scheme}://{u.netloc.lower()}{u.path.rstrip('/')}"      # drop query / fragment / trailing slash
+
+
+def list_target(url, platform):
+    if platform == "youtube" and not re.search(r"/(videos|shorts|streams|playlists|watch)$|/playlist|watch\?", url):
+        return url + "/videos"
+    return url
+
+
+def _run_split(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+def parse_gdl_posts(stdout, limit):
+    """Newest-first (id, post_url) pairs from `gallery-dl --dump-json` output."""
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return []
+    out, seen = [], set()
+    for e in data if isinstance(data, list) else []:
+        meta = e[-1] if isinstance(e, list) and e and isinstance(e[-1], dict) else None
+        if not meta:
+            continue
+        key = url = None
+        if meta.get("post_shortcode"):
+            sc = meta["post_shortcode"]
+            key, url = "ig:" + str(sc), meta.get("post_url") or f"https://www.instagram.com/p/{sc}/"
+        elif meta.get("tweet_id"):
+            if meta.get("retweet_id"):
+                continue          # a retweet is not their own post
+            tid = meta["tweet_id"]
+            key, url = "tw:" + str(tid), f"https://x.com/i/status/{tid}"
+        elif meta.get("category") == "pinterest" and meta.get("id"):
+            key, url = "pin:" + str(meta["id"]), f"https://www.pinterest.com/pin/{meta['id']}/"
+        if key and key not in seen:
+            seen.add(key)
+            out.append((key, url))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def list_profile(url, platform, cookies_dir=None, limit=FOLLOW_LIST):
+    """Newest-first list of (post_id, post_url) for a profile. Raises RuntimeError on failure."""
+    target = list_target(url, platform)
+    cf = Path(cookies_dir) / f"{platform}.txt" if cookies_dir else None
+    ck = ["--cookies", str(cf)] if cf and cf.exists() else []
+    if platform == "youtube":
+        code, out, err = _run_split([*lg.YTDLP, "--flat-playlist", "--playlist-end", str(limit),
+                                     "--print", "%(id)s", *ck, target])
+        ids = [x.strip() for x in out.splitlines() if re.fullmatch(r"[\w-]{6,20}", x.strip())]
+        if not ids:
+            raise RuntimeError((err.strip().splitlines() or ["no videos found"])[-1][:300])
+        return [(i, f"https://www.youtube.com/watch?v={i}") for i in ids]
+    code, out, err = _run_split([*lg.GDL, "--range", f"1-{limit * 4}", "--dump-json", *ck, target])
+    posts = parse_gdl_posts(out, limit)
+    if not posts:
+        raise RuntimeError((err.strip().splitlines() or ["no posts found (private, empty or login needed)"])[-1][:300])
+    return posts
+
+
+class FollowStore:
+    """Profiles being followed, saved to a json file. Commands from the listener wait in `pending`."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.items = []
+        self.pending = []
+        if self.path.exists():
+            try:
+                self.items = json.loads(self.path.read_text(encoding="utf-8")).get("follows", [])
+            except Exception:
+                print(f"{self.path} could not be read; starting with nobody followed.")
+
+    def save(self):
+        with self.lock:
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps({"follows": self.items}), encoding="utf-8")
+            tmp.replace(self.path)
+
+    def find(self, url):
+        n = norm_profile(url).lower()
+        return next((f for f in self.items if f["url"].lower() == n), None)
+
+    def add(self, url, platform, ids):
+        f = {"url": norm_profile(url), "platform": platform, "seen": list(ids),
+             "next_check": time.time() + FOLLOW_EVERY * random.uniform(0.8, 1.2), "fails": 0}
+        self.items.append(f)
+        self.save()
+        return f
+
+    def remove(self, url):
+        f = self.find(url)
+        if f:
+            self.items.remove(f)
+            self.save()
+        return f is not None
+
+    def due(self, t):
+        ready = [f for f in self.items if f.get("next_check", 0) <= t]
+        return min(ready, key=lambda f: f["next_check"]) if ready else None
+
+
+def handle_follow_command(cfg, fs, msg, text, reply, watched):
+    """Listener side: acknowledge at once and hand the real work to the follow thread."""
+    cmd = FOLLOW_RE.match(text).group(1).lower()
+    plats = cfg.get("PLATFORMS")
+    if cmd == "following":
+        mine = [f["url"] for f in fs.items]
+        if mine:
+            say(cfg, reply, f"[{cfg.get('NAME', 'bot')}] following {len(mine)}:\n" + "\n".join(mine))
+        elif not watched:
+            say(cfg, reply, f"[{cfg.get('NAME', 'bot')}] not following anyone yet.")
+        return
+    urls = [u for u in URL_RE.findall(text) if not plats or lg.detect_platform(u) in plats]
+    if not urls:
+        return    # another bot owns this site (or no link given)
+    react(cfg, msg["chat"]["id"], msg["message_id"], REACT_RECEIVED)
+    for u in urls:
+        fs.pending.append({"cmd": cmd, "url": u, "chat": msg["chat"]["id"], "mid": msg["message_id"],
+                           "reply": reply, "watched": watched})
+
+
+def run_follow_command(cfg, fs, c, cookies_dir):
+    url, platform = norm_profile(c["url"]), lg.detect_platform(c["url"])
+    ok = True
+    if c["cmd"] == "unfollow":
+        say(cfg, c["reply"], ("Stopped following " if fs.remove(url) else "Was not following ") + url)
+    elif fs.find(url):
+        say(cfg, c["reply"], f"Already following {url}.")
+    else:
+        try:
+            ids = [i for i, _ in list_profile(url, platform, cookies_dir)]
+            fs.add(url, platform, ids)
+            say(cfg, c["reply"], f"Following {url}. The {len(ids)} newest existing posts are marked as seen "
+                                 f"and won't be posted; anything new will, checked about every "
+                                 f"{FOLLOW_EVERY / 60:.0f} min.")
+        except RuntimeError as e:
+            ok = False
+            say(cfg, c["reply"], f"Could not read that profile ({platform}): {e}. Not following it.")
+    if ok:
+        if c["watched"] and cfg.get("DELETE_ORIGINAL", "true").lower() != "false":
+            try:
+                api(cfg, "deleteMessage", {"chat_id": c["chat"], "message_id": c["mid"]})
+            except TgError:
+                pass
+    else:
+        react(cfg, c["chat"], c["mid"], REACT_FAILED)
+
+
+def check_follow(cfg, qs, fs, f, cookies_dir):
+    now_t = time.time()
+    try:
+        items = list_profile(f["url"], f["platform"], cookies_dir)
+    except RuntimeError as e:
+        f["fails"] = f.get("fails", 0) + 1
+        f["next_check"] = now_t + min(FOLLOW_EVERY * (1 + f["fails"]), 6 * 3600)
+        if f["fails"] in (1, 5, 20):
+            say(cfg, int(cfg["ALLOWED_USER_ID"]), f"Could not check {f['url']} ({f['fails']} in a row): {e}")
+        fs.save()
+        return 0
+    f["fails"] = 0
+    seen = set(f["seen"])
+    new = [(i, u) for i, u in items if i not in seen]
+    for i, u in reversed(new):                       # oldest first
+        qs.add({"key": f"follow:{f['platform']}:{i}", "chat": cfg["GROUP"], "mid": None, "urls": [u],
+                "quality": "best", "watched": True, "follow": True, "reply": int(cfg["ALLOWED_USER_ID"]),
+                "ok": True, "tries": 0, "all_mine": True})
+        f["seen"].append(i)
+    f["seen"] = f["seen"][-FOLLOW_SEEN_MAX:]
+    f["next_check"] = now_t + FOLLOW_EVERY * random.uniform(0.8, 1.2)
+    fs.save()
+    if new:
+        print(f"[{cfg.get('NAME', 'bot')}] {len(new)} new post(s) from {f['url']}")
+    return len(new)
+
+
+def follow_loop(cfg, qs, fs, cookies_dir):
+    while not STOP.is_set():
+        try:
+            if fs.pending:
+                run_follow_command(cfg, fs, fs.pending.pop(0), cookies_dir)
+                STOP.wait(random.uniform(*FOLLOW_GAP) / 6)
+                continue
+            f = fs.due(time.time())
+            if f is None:
+                STOP.wait(5)
+                continue
+            check_follow(cfg, qs, fs, f, cookies_dir)
+            STOP.wait(random.uniform(*FOLLOW_GAP))
+        except Exception as e:     # a bug here must not stop the other parts
+            print("  (follow problem:", str(e).replace(cfg["BOT_TOKEN"], "***"), ")")
+            STOP.wait(30)
+
+
+def seed_follows(cfg, fs, cookies_dir):
+    """FOLLOWS=<link>,<link> in the environment: re-adds profiles on hosts that lose files on restart."""
+    plats = cfg.get("PLATFORMS")
+    for u in re.split(r"[\s,]+", os.environ.get("FOLLOWS", "")):
+        if not u.startswith("http") or fs.find(u):
+            continue
+        p = lg.detect_platform(u)
+        if plats and p not in plats:
+            continue
+        try:
+            fs.add(u, p, [i for i, _ in list_profile(norm_profile(u), p, cookies_dir)])
+            print(f"[{cfg.get('NAME', 'bot')}] following {norm_profile(u)} (from FOLLOWS)")
+        except RuntimeError as e:
+            print(f"[{cfg.get('NAME', 'bot')}] could not follow {u} from FOLLOWS: {e}")
 
 
 # ---------------------------------------------------------------- worker
@@ -502,7 +737,9 @@ def process_job(cfg, qs, job, out_root, cookies_dir, state):
             countdown_sleep(wait, f"[{cfg.get('NAME', 'bot')}] {label}")
     if STOP.is_set() and job["urls"]:
         return   # stopped mid-job: it stays in queue.json and resumes next time
-    if job["ok"]:
+    if job.get("follow"):
+        pass   # a followed post has no original message to delete or react to
+    elif job["ok"]:
         if job["watched"]:
             if not job.get("all_mine", True):
                 pass   # the post also has links for other bots; leave it so a failure there is not lost
@@ -536,7 +773,8 @@ def worker_loop(cfg, qs, out_root, cookies_dir, state):
             process_job(cfg, qs, job, out_root, cookies_dir, state)
         except Exception as e:   # a bug on one job must not freeze the queue
             print("  (unexpected problem, skipping this post:", str(e).replace(cfg["BOT_TOKEN"], "***"), ")")
-            react(cfg, job["chat"], job["mid"], REACT_FAILED)
+            if not job.get("follow"):
+                react(cfg, job["chat"], job["mid"], REACT_FAILED)
             qs.finish(job)
 
 
@@ -579,9 +817,14 @@ def start_bot(base, name, token, cookies_dir):
     qs = QueueStore(f"queue_{name}.json")
     if qs.jobs:
         print(f"[{name}] resuming {len(qs.jobs)} saved post(s) from queue_{name}.json")
+    fs = FollowStore(f"follows_{name}.json")
+    seed_follows(cfg, fs, cookies_dir)
+    if fs.items:
+        print(f"[{name}] following {len(fs.items)} profile(s)")
     state = {"offset": None, "count": 0}
     threading.Thread(target=worker_loop, args=(cfg, qs, OUT_ROOT / name, cookies_dir, state), daemon=True).start()
-    threading.Thread(target=listener_loop, args=(cfg, qs, state), daemon=True).start()
+    threading.Thread(target=follow_loop, args=(cfg, qs, fs, cookies_dir), daemon=True).start()
+    threading.Thread(target=listener_loop, args=(cfg, qs, state, fs), daemon=True).start()
     return qs
 
 
@@ -619,11 +862,14 @@ def main():
     qs = QueueStore()
     if qs.jobs:
         print(f"Resuming {len(qs.jobs)} saved post(s) ({qs.waiting_links()} link(s)) from queue.json.")
+    fs = FollowStore("follows.json")
+    seed_follows(cfg, fs, cookies_dir)
     state = {"offset": None, "count": 0}
     worker = threading.Thread(target=worker_loop, args=(cfg, qs, OUT_ROOT, cookies_dir, state), daemon=True)
     worker.start()
+    threading.Thread(target=follow_loop, args=(cfg, qs, fs, cookies_dir), daemon=True).start()
     try:
-        listener_loop(cfg, qs, state)
+        listener_loop(cfg, qs, state, fs)
     except KeyboardInterrupt:
         pass
     finally:
