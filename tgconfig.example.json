@@ -1,0 +1,11 @@
+{
+  "GROUP": "@nosepool",
+  "ALLOWED_USER_ID": "your-numeric-telegram-id",
+  "DELETE_ORIGINAL": "true",
+  "TOKENS": {
+    "instagram": "token-of-the-instagram-bot",
+    "twitter": "token-of-the-twitter-bot",
+    "pinterest": "token-of-the-pinterest-bot",
+    "youtube": "token-of-the-youtube-bot"
+  }
+}
