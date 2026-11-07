@@ -28,6 +28,11 @@ Every bot reads the channel but only takes links from its own site. ONLY=youtube
 ONLY=instagram,twitter,pinterest) picks which of them this computer/server runs.
 If PORT is set (e.g. on Render) a tiny status page is served so a pinger can keep it awake.
 
+DAILY LIMIT: each bot counts how many links it fetched today and stops at its limit (default
+100 for instagram, 200 for the others; DAILY_LIMIT_<SITE> or DAILY_LIMIT in the environment
+changes it, 0 = no limit). Waiting links stay queued and carry on after midnight (India time;
+DAY_OFFSET_HOURS changes that); you get one message when a bot reaches its limit.
+
 FOLLOWING PROFILES: post   follow <profile link>   in the channel (or privately to the bot).
 The bot that owns that site remembers the profile, checks it every FOLLOW_EVERY_MIN minutes
 (default 120, with random jitter) and posts anything new to the channel. Posts that already exist
@@ -74,6 +79,9 @@ FOLLOW_EVERY = float(os.environ.get("FOLLOW_EVERY_MIN", "120")) * 60   # seconds
 FOLLOW_GAP = (60, 180)             # seconds between two profile checks (any profile)
 FOLLOW_LIST = 10                   # newest posts looked at per check
 FOLLOW_SEEN_MAX = 300
+
+DEFAULT_DAILY = {"instagram": 100, "twitter": 200, "pinterest": 200, "youtube": 200}
+DAY_OFFSET_HOURS = float(os.environ.get("DAY_OFFSET_HOURS", "5.5"))      # day rolls over at midnight in this zone
 
 STOP = threading.Event()
 OUT_ROOT = Path("Downloads")
@@ -467,6 +475,63 @@ def listener_loop(cfg, qs, state, fs=None):
         listener_step(cfg, qs, state, fs=fs)
 
 
+# ---------------------------------------------------------------- daily limit
+class UsageStore:
+    """How many links this bot fetched today (saved to a file). limit 0 = unlimited."""
+
+    def __init__(self, path, limit):
+        self.path = Path(path)
+        self.limit = int(limit)
+        self.lock = threading.Lock()
+        self.day, self.count, self.notified = self.today(), 0, False
+        if self.path.exists():
+            try:
+                d = json.loads(self.path.read_text(encoding="utf-8"))
+                if d.get("day") == self.day:
+                    self.count, self.notified = int(d.get("count", 0)), bool(d.get("notified", False))
+            except Exception:
+                pass
+
+    @staticmethod
+    def today():
+        return time.strftime("%Y-%m-%d", time.gmtime(time.time() + DAY_OFFSET_HOURS * 3600))
+
+    def _roll(self):    # caller holds the lock
+        t = self.today()
+        if t != self.day:
+            self.day, self.count, self.notified = t, 0, False
+
+    def _save(self):    # caller holds the lock
+        self.path.write_text(json.dumps({"day": self.day, "count": self.count, "notified": self.notified}),
+                             encoding="utf-8")
+
+    def add(self):
+        with self.lock:
+            self._roll()
+            self.count += 1
+            self._save()
+
+    def at_limit(self):
+        with self.lock:
+            self._roll()
+            return self.limit > 0 and self.count >= self.limit
+
+    def mark_notified(self):
+        """True the first time it is called on a given day, so the warning is sent once."""
+        with self.lock:
+            self._roll()
+            if self.notified:
+                return False
+            self.notified = True
+            self._save()
+            return True
+
+
+def daily_limit(name):
+    env = os.environ.get(f"DAILY_LIMIT_{name.upper()}", os.environ.get("DAILY_LIMIT"))
+    return int(env) if env not in (None, "") else DEFAULT_DAILY.get(name, 0)
+
+
 # ---------------------------------------------------------------- following profiles
 def norm_profile(url):
     u = urlparse(url.strip().rstrip(".,)"))
@@ -704,8 +769,13 @@ def pace_wait(state):
 def process_job(cfg, qs, job, out_root, cookies_dir, state):
     chatty = not job["watched"]
     job.pop("not_before", None)
+    usage = state.get("usage")
     while job["urls"] and not STOP.is_set():
+        if usage and usage.at_limit():
+            return   # the rest of this post stays in the queue and continues after midnight
         url = job["urls"][0]
+        if usage:
+            usage.add()
         print(f"[{now()}] downloading {url} ({job['quality']}) - {qs.waiting_links() - 1} more waiting after this")
         result = handle_link(cfg, job["reply"], url, job["quality"], out_root, cookies_dir, chatty)
         state["count"] += 1
@@ -760,7 +830,15 @@ def process_job(cfg, qs, job, out_root, cookies_dir, state):
 
 def worker_loop(cfg, qs, out_root, cookies_dir, state):
     last_beat = 0.0
+    usage = state.get("usage")
     while not STOP.is_set():
+        if usage and usage.at_limit():
+            if qs.jobs and usage.mark_notified():
+                say(cfg, int(cfg["ALLOWED_USER_ID"]),
+                    f"[{cfg.get('NAME', 'bot')}] reached today's limit of {usage.limit} links. "
+                    f"{qs.waiting_links()} waiting; they continue after midnight.")
+            STOP.wait(5)
+            continue
         job = qs.next_ready()
         if job is None:
             wait = qs.earliest_wait() if qs.jobs else 0
@@ -821,7 +899,8 @@ def start_bot(base, name, token, cookies_dir):
     seed_follows(cfg, fs, cookies_dir)
     if fs.items:
         print(f"[{name}] following {len(fs.items)} profile(s)")
-    state = {"offset": None, "count": 0}
+    state = {"offset": None, "count": 0, "usage": UsageStore(f"usage_{name}.json", daily_limit(name))}
+    print(f"[{name}] daily limit: {state['usage'].limit or 'none'}")
     threading.Thread(target=worker_loop, args=(cfg, qs, OUT_ROOT / name, cookies_dir, state), daemon=True).start()
     threading.Thread(target=follow_loop, args=(cfg, qs, fs, cookies_dir), daemon=True).start()
     threading.Thread(target=listener_loop, args=(cfg, qs, state, fs), daemon=True).start()
@@ -864,7 +943,8 @@ def main():
         print(f"Resuming {len(qs.jobs)} saved post(s) ({qs.waiting_links()} link(s)) from queue.json.")
     fs = FollowStore("follows.json")
     seed_follows(cfg, fs, cookies_dir)
-    state = {"offset": None, "count": 0}
+    lim = int(os.environ.get("DAILY_LIMIT", "0") or 0)
+    state = {"offset": None, "count": 0, "usage": UsageStore("usage.json", lim)} if lim else {"offset": None, "count": 0}
     worker = threading.Thread(target=worker_loop, args=(cfg, qs, OUT_ROOT, cookies_dir, state), daemon=True)
     worker.start()
     threading.Thread(target=follow_loop, args=(cfg, qs, fs, cookies_dir), daemon=True).start()

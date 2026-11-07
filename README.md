@@ -125,3 +125,8 @@ posts next is downloaded and posted to the channel by itself.
   (Render free), set `FOLLOWS=<link>,<link>` in the environment: every restart re-adds those profiles
   (silently, without posting what already exists).
 - Tested against a fake Telegram and sample downloader output only, not against the real sites.
+
+## Daily limit
+Each bot counts the links it fetched today and stops at its limit: 100 for instagram, 200 for twitter, pinterest and youtube.
+Change with env `DAILY_LIMIT_INSTAGRAM` (or `_TWITTER`, `_PINTEREST`, `_YOUTUBE`), or `DAILY_LIMIT` for all (0 = no limit).
+Waiting links stay queued and continue after midnight India time (`DAY_OFFSET_HOURS`, default 5.5). One message is sent when a bot reaches its limit.
