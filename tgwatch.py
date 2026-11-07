@@ -72,7 +72,8 @@ REACT_FAILED = "\U0001F44E"        # thumbs down  (red X is not an allowed react
 REACT_DONE = "\U0001F44D"          # thumbs up (private chat only; channel posts get deleted)
 
 BOT_DEFS = {"instagram": ["instagram"], "twitter": ["twitter"],
-            "pinterest": ["pinterest"], "youtube": ["youtube"]}   # one bot per site
+            "pinterest": ["pinterest"], "youtube": ["youtube"],
+            "reddit": ["reddit"]}   # one bot per site
 
 FOLLOW_RE = re.compile(r"^\s*(follow|unfollow|following)\b", re.I)
 FOLLOW_EVERY = float(os.environ.get("FOLLOW_EVERY_MIN", "120")) * 60   # seconds between checks of one profile
@@ -80,7 +81,7 @@ FOLLOW_GAP = (60, 180)             # seconds between two profile checks (any pro
 FOLLOW_LIST = 10                   # newest posts looked at per check
 FOLLOW_SEEN_MAX = 300
 
-DEFAULT_DAILY = {"instagram": 100, "twitter": 200, "pinterest": 200, "youtube": 200}
+DEFAULT_DAILY = {"instagram": 100, "twitter": 200, "pinterest": 200, "youtube": 200, "reddit": 200}
 DAY_OFFSET_HOURS = float(os.environ.get("DAY_OFFSET_HOURS", "5.5"))      # day rolls over at midnight in this zone
 
 STOP = threading.Event()

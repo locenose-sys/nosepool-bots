@@ -130,3 +130,6 @@ posts next is downloaded and posted to the channel by itself.
 Each bot counts the links it fetched today and stops at its limit: 100 for instagram, 200 for twitter, pinterest and youtube.
 Change with env `DAILY_LIMIT_INSTAGRAM` (or `_TWITTER`, `_PINTEREST`, `_YOUTUBE`), or `DAILY_LIMIT` for all (0 = no limit).
 Waiting links stay queued and continue after midnight India time (`DAY_OFFSET_HOURS`, default 5.5). One message is sent when a bot reaches its limit.
+
+## Reddit bot
+A fifth bot, `reddit`, takes Reddit links (token in `TOKEN_REDDIT`, daily cap 200). Reddit often blocks server IPs or wants a login; if it fails from Render, put `cookies/reddit.txt` next to the program. Following Reddit profiles is not supported.
